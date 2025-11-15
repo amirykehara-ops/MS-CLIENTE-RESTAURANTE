@@ -1,5 +1,6 @@
 org: amirykehara  # Unificado; cambia si usas la otra org
 service: pardos-unified  # Nombre unificado para cliente + restaurante
+frameworkVersion: '3'
 
 provider:
   name: aws
@@ -10,10 +11,10 @@ provider:
   iam:
     role: arn:aws:iam::773506457076:role/LabRole  # De la primera cuenta; ajusta si necesario
   environment:
-    CUSTOMERS_TABLE: CustomersTable-${self:provider.stage}
-    ORDERS_TABLE: OrdersTable-${self:provider.stage}
-    STEPS_TABLE: StepsTable-${self:provider.stage}
-    EVENT_BUS_NAME: PardosEventBus-${self:provider.stage}
+    CUSTOMERS_TABLE: CustomersTable-${opt:stage, 'dev'}
+    ORDERS_TABLE: OrdersTable-${opt:stage, 'dev'}
+    STEPS_TABLE: StepsTable-${opt:stage, 'dev'}
+    EVENT_BUS_NAME: PardosEventBus-${opt:stage, 'dev'}
   httpApi:
     cors: true  # Global para todos los endpoints (reemplaza cors: true del segundo)
 
@@ -96,11 +97,11 @@ functions:
 
 resources:
   Resources:
-    # === TABLAS DYNAMODB (unificadas con suffix stage) ===
+    # === TABLAS DYNAMODB (unificadas con suffix stage via opt) ===
     CustomersTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: !Sub CustomersTable-${AWS::StackName}  # Ej: CustomersTable-pardos-unified-dev
+        TableName: !Sub CustomersTable-${self:service}-${opt:stage, 'dev'}
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -115,7 +116,7 @@ resources:
     OrdersTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: !Sub OrdersTable-${AWS::StackName}
+        TableName: !Sub OrdersTable-${self:service}-${opt:stage, 'dev'}
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -130,7 +131,7 @@ resources:
     StepsTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: !Sub StepsTable-${AWS::StackName}
+        TableName: !Sub StepsTable-${self:service}-${opt:stage, 'dev'}
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -147,7 +148,7 @@ resources:
     PardosEventBus:
       Type: AWS::Events::EventBus
       Properties:
-        Name: !Sub PardosEventBus-${AWS::StackName}  # Ej: PardosEventBus-pardos-unified-dev
+        Name: !Sub PardosEventBus-${self:service}-${opt:stage, 'dev'}
 
     # Rule: OrderCreated -> Step Functions (directo, eficiente)
     OrderCreatedRule:
@@ -169,7 +170,7 @@ resources:
     OrderWorkflowStateMachine:
       Type: AWS::StepFunctions::StateMachine
       Properties:
-        StateMachineName: !Sub OrderWorkflow-${AWS::StackName}
+        StateMachineName: !Sub OrderWorkflow-${self:service}-${opt:stage, 'dev'}
         DefinitionString: !Sub |
           {
             "Comment": "Flujo de pedido: CREATED → COOKING → PACKAGING → DELIVERY → DELIVERED",
