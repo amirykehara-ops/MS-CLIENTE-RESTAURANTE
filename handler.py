@@ -1,6 +1,7 @@
 import json
 import boto3
 import uuid
+import os
 from datetime import datetime
 from shared.database import DynamoDB
 from shared.events import EventBridge
@@ -18,7 +19,7 @@ def create_order(event, context):
         order_id = str(uuid.uuid4())  # Genera ID único y escalable
         timestamp = datetime.utcnow().isoformat()
 
-        # Crea el registro de order metadata en DynamoDB (asumiendo estructura simple; agrega items si es necesario)
+        # Crea el registro de order metadata en DynamoDB (usando env var)
         order_metadata = {
             'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
             'SK': 'METADATA',
@@ -29,10 +30,9 @@ def create_order(event, context):
             'createdAt': timestamp,
             'currentStep': 'CREATED'  # Inicia en CREATED, el workflow lo moverá a COOKING
         }
-        dynamodb.put_item('orders', order_metadata)
+        dynamodb.put_item(os.environ['ORDERS_TABLE'], order_metadata)
 
         # Publica evento con order_id para propagar al workflow (Step Functions via EventBridge)
-        # Esto envía el ID automáticamente a las funciones de etapas del "restaurante"
         events.publish_event(
             source="pardos.orders",
             detail_type="OrderCreated",
@@ -65,7 +65,7 @@ def get_orders_by_customer(event, context):
         # Query eficiente: asumiendo GSI en customerId (agrega en serverless si no existe)
         # Por ahora, usa scan con filtro (no ideal para prod, pero práctico sin rehacer schema)
         response = dynamodb.scan(
-            table_name='orders',
+            table_name=os.environ['ORDERS_TABLE'],
             filter_expression='customerId = :cid',
             expression_attribute_values={':cid': customer_id}
         )
@@ -92,7 +92,7 @@ def create_customer(event, context):
             'email': body.get('email'),
             'createdAt': timestamp
         }
-        dynamodb.put_item('customers', customer)
+        dynamodb.put_item(os.environ['CUSTOMERS_TABLE'], customer)
         return {
             'statusCode': 201,
             'body': json.dumps({'customerId': customer_id, 'message': 'Customer created'})
@@ -105,7 +105,7 @@ def get_customer(event, context):
         customer_id = event['pathParameters']['customerId']
         tenant_id = 'pardos'
         response = dynamodb.get_item(
-            table_name='customers',
+            table_name=os.environ['CUSTOMERS_TABLE'],
             key={'PK': f"TENANT#{tenant_id}#CUSTOMER#{customer_id}", 'SK': 'METADATA'}
         )
         item = response.get('Item')
@@ -123,7 +123,7 @@ def get_order(event, context):
         order_id = event['pathParameters']['orderId']
         tenant_id = 'pardos'
         response = dynamodb.query(
-            table_name='orders',
+            table_name=os.environ['ORDERS_TABLE'],
             key_condition_expression='PK = :pk AND SK = :sk',
             expression_attribute_values={
                 ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}",
@@ -172,9 +172,9 @@ def iniciar_etapa(event, context):
             'tenantId': tenant_id,
             'orderId': order_id
         }
-        dynamodb.put_item('steps', step_record)
+        dynamodb.put_item(os.environ['STEPS_TABLE'], step_record)
         dynamodb.update_item(
-            table_name='orders',
+            table_name=os.environ['ORDERS_TABLE'],
             key={
                 'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
                 'SK': 'METADATA'
@@ -216,7 +216,7 @@ def completar_etapa(event, context):
         tenant_id = body['tenantId']
         stage = body['stage']
         response = dynamodb.query(
-            table_name='steps',
+            table_name=os.environ['STEPS_TABLE'],
             key_condition_expression='PK = :pk AND begins_with(SK, :sk)',
             expression_attribute_values={
                 ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}",
@@ -231,7 +231,7 @@ def completar_etapa(event, context):
         latest_step = max(response['Items'], key=lambda x: x['startedAt'])
         timestamp = datetime.utcnow().isoformat()
         dynamodb.update_item(
-            table_name='steps',
+            table_name=os.environ['STEPS_TABLE'],
             key={
                 'PK': latest_step['PK'],
                 'SK': latest_step['SK']
@@ -424,7 +424,7 @@ def registrar_etapa(tenant_id, order_id, stage, status):
         }
         if status == 'COMPLETED':
             step_record['finishedAt'] = timestamp
-        dynamodb.put_item('steps', step_record)
+        dynamodb.put_item(os.environ['STEPS_TABLE'], step_record)
         print(f"Etapa {stage} registrada para orden {order_id}")
     except Exception as e:
         print(f"Error registrando etapa: {str(e)}")
@@ -432,7 +432,7 @@ def registrar_etapa(tenant_id, order_id, stage, status):
 def completar_etapa_automatica(tenant_id, order_id, stage):
     try:
         response = dynamodb.query(
-            table_name='steps',
+            table_name=os.environ['STEPS_TABLE'],
             key_condition_expression='PK = :pk AND begins_with(SK, :sk)',
             expression_attribute_values={
                 ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}",
@@ -443,7 +443,7 @@ def completar_etapa_automatica(tenant_id, order_id, stage):
             latest_step = max(response['Items'], key=lambda x: x['startedAt'])
             timestamp = datetime.utcnow().isoformat()
             dynamodb.update_item(
-                table_name='steps',
+                table_name=os.environ['STEPS_TABLE'],
                 key={
                     'PK': latest_step['PK'],
                     'SK': latest_step['SK']
