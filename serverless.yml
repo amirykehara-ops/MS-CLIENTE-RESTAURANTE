@@ -1,6 +1,5 @@
 org: amirykehara  # Unificado; cambia si usas la otra org
 service: pardos-unified  # Nombre unificado para cliente + restaurante
-frameworkVersion: '3'
 
 provider:
   name: aws
