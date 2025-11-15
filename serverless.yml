@@ -1,25 +1,23 @@
-org: amirykehara  # Unificado; cambia si usas la otra org
-service: pardos-unified  # Nombre unificado para cliente + restaurante
-frameworkVersion: '3'
+org: amirykehara
+service: pardos-unified
 
 provider:
   name: aws
   runtime: python3.13
   region: us-east-1
   memorySize: 256
-  timeout: 29  # Reducido para evitar warnings en HTTP API (max 30s)
+  timeout: 29
   iam:
-    role: arn:aws:iam::773506457076:role/LabRole  # De la primera cuenta; ajusta si necesario
+    role: arn:aws:iam::773506457076:role/LabRole
   environment:
-    CUSTOMERS_TABLE: CustomersTable-${opt:stage, 'dev'}
-    ORDERS_TABLE: OrdersTable-${opt:stage, 'dev'}
-    STEPS_TABLE: StepsTable-${opt:stage, 'dev'}
-    EVENT_BUS_NAME: PardosEventBus-${opt:stage, 'dev'}
+    CUSTOMERS_TABLE: CustomersTable-pardos-unified-dev
+    ORDERS_TABLE: OrdersTable-pardos-unified-dev
+    STEPS_TABLE: StepsTable-pardos-unified-dev
+    EVENT_BUS_NAME: PardosEventBus-pardos-unified-dev
   httpApi:
-    cors: true  # Global para todos los endpoints (reemplaza cors: true del segundo)
+    cors: true
 
 functions:
-  # === CLIENTE API ===
   createOrder:
     handler: handler.create_order
     events:
@@ -50,8 +48,6 @@ functions:
       - httpApi:
           path: /order/{orderId}
           method: get
-
-  # === RESTAURANTE API (Etapas manuales) ===
   iniciarEtapa:
     handler: handler.iniciar_etapa
     events:
@@ -64,8 +60,6 @@ functions:
       - httpApi:
           path: /etapas/completar
           method: post
-
-  # === DASHBOARD API (del segundo; implementa handlers) ===
   obtenerResumen:
     handler: handler.obtener_resumen
     events:
@@ -84,43 +78,38 @@ functions:
       - httpApi:
           path: /dashboard/pedidos
           method: get
-
-  # === WORKFLOW STEP FUNCTIONS (automático via EventBridge) ===
   cookingStage:
-    handler: handler.cooking_stage
+    handler: handler.process_cooking
   packagingStage:
-    handler: handler.packaging_stage
+    handler: handler.process_packaging
   deliveryStage:
-    handler: handler.delivery_stage
+    handler: handler.process_delivery
   deliveredStage:
-    handler: handler.delivered_stage
+    handler: handler.process_delivered
 
 resources:
   Resources:
-    # === TABLAS DYNAMODB (unificadas con suffix stage via opt) ===
     CustomersTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: !Sub CustomersTable-${self:service}-${opt:stage, 'dev'}
+        TableName: CustomersTable-pardos-unified-dev
         AttributeDefinitions:
           - AttributeName: PK
-            AttributeType: S
-          - AttributeName: SK
             AttributeType: S
         KeySchema:
           - AttributeName: PK
             KeyType: HASH
-          - AttributeName: SK
-            KeyType: RANGE
         BillingMode: PAY_PER_REQUEST
     OrdersTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: !Sub OrdersTable-${self:service}-${opt:stage, 'dev'}
+        TableName: OrdersTable-pardos-unified-dev
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
           - AttributeName: SK
+            AttributeType: S
+          - AttributeName: customerId
             AttributeType: S
         KeySchema:
           - AttributeName: PK
@@ -128,10 +117,17 @@ resources:
           - AttributeName: SK
             KeyType: RANGE
         BillingMode: PAY_PER_REQUEST
+        GlobalSecondaryIndexes:
+          - IndexName: customerId-index
+            KeySchema:
+              - AttributeName: customerId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
     StepsTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: !Sub StepsTable-${self:service}-${opt:stage, 'dev'}
+        TableName: StepsTable-pardos-unified-dev
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -143,14 +139,10 @@ resources:
           - AttributeName: SK
             KeyType: RANGE
         BillingMode: PAY_PER_REQUEST
-
-    # === EVENTBRIDGE ===
     PardosEventBus:
       Type: AWS::Events::EventBus
       Properties:
-        Name: !Sub PardosEventBus-${self:service}-${opt:stage, 'dev'}
-
-    # Rule: OrderCreated -> Step Functions (directo, eficiente)
+        Name: PardosEventBus-pardos-unified-dev
     OrderCreatedRule:
       Type: AWS::Events::Rule
       Properties:
@@ -165,12 +157,10 @@ resources:
           - Arn: !Ref OrderWorkflowStateMachine
             Id: StepFunctionsTarget
             RoleArn: arn:aws:iam::773506457076:role/LabRole
-
-    # === STEP FUNCTIONS ===
     OrderWorkflowStateMachine:
       Type: AWS::StepFunctions::StateMachine
       Properties:
-        StateMachineName: !Sub OrderWorkflow-${self:service}-${opt:stage, 'dev'}
+        StateMachineName: OrderWorkflow-pardos-unified-dev
         DefinitionString: !Sub |
           {
             "Comment": "Flujo de pedido: CREATED → COOKING → PACKAGING → DELIVERY → DELIVERED",
@@ -199,8 +189,3 @@ resources:
             }
           }
         RoleArn: arn:aws:iam::773506457076:role/LabRole
-
-# Opcional: Para paquetes Python externos
-# custom:
-#   pythonRequirements:
-#     dockerizePip: true

@@ -3,11 +3,26 @@ import boto3
 import uuid
 import os
 from datetime import datetime
+from decimal import Decimal
+from boto3.dynamodb.conditions import Key
 from shared.database import DynamoDB
 from shared.events import EventBridge
 
-dynamodb = DynamoDB()
-events = EventBridge()
+# Inicialización lazy: No crear globales en import time
+dynamodb = None
+events = None
+
+def _get_dynamodb():
+    global dynamodb
+    if dynamodb is None:
+        dynamodb = DynamoDB()
+    return dynamodb
+
+def _get_events():
+    global events
+    if events is None:
+        events = EventBridge()
+    return events
 
 # === FUNCIONES DEL CLIENTE (API para crear/obtener customers y orders) ===
 
@@ -16,30 +31,47 @@ def create_order(event, context):
         body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
         customer_id = body['customerId']
         tenant_id = body.get('tenantId', 'pardos')
-        order_id = str(uuid.uuid4())  # Genera ID único y escalable
+        order_id = str(uuid.uuid4())  # UUID para escalabilidad
         timestamp = datetime.utcnow().isoformat()
 
-        # Crea el registro de order metadata en DynamoDB (usando env var)
+        # Convierte a Decimal para items y total
+        if 'items' in body:
+            body['items'] = [{k: Decimal(v) if k == 'price' else v for k, v in item.items()} for item in body['items']]
+        total = Decimal(body.get('total', '0'))
+
+        # Crea el registro de order metadata en DynamoDB con SK="INFO"
         order_metadata = {
             'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
-            'SK': 'METADATA',
+            'SK': 'INFO',
             'orderId': order_id,
             'customerId': customer_id,
             'tenantId': tenant_id,
             'status': 'CREATED',
+            'items': body.get('items', []),  # Lista de {productId, qty, price} con Decimal
+            'total': total,  # Decimal para total
             'createdAt': timestamp,
             'currentStep': 'CREATED'  # Inicia en CREATED, el workflow lo moverá a COOKING
         }
-        dynamodb.put_item(os.environ['ORDERS_TABLE'], order_metadata)
+        _get_dynamodb().put_item(os.environ['ORDERS_TABLE'], order_metadata)
 
-        # Publica evento con order_id para propagar al workflow (Step Functions via EventBridge)
-        events.publish_event(
+        # Publica evento con detalles (convertir Decimal a float para JSON)
+        items_for_event = [
+            {
+                "productId": item["productId"],
+                "qty": int(item["qty"]),
+                "price": float(item["price"])
+            }
+            for item in body.get('items', [])
+        ]
+        _get_events().publish_event(
             source="pardos.orders",
             detail_type="OrderCreated",
             detail={
                 'orderId': order_id,
                 'tenantId': tenant_id,
                 'customerId': customer_id,
+                'total': float(total),
+                'items': items_for_event,
                 'timestamp': timestamp
             }
         )
@@ -61,10 +93,8 @@ def create_order(event, context):
 def get_orders_by_customer(event, context):
     try:
         customer_id = event['pathParameters']['customerId']
-        tenant_id = 'pardos'  # Fijo o de headers/event
-        # Query eficiente: asumiendo GSI en customerId (agrega en serverless si no existe)
-        # Por ahora, usa scan con filtro (no ideal para prod, pero práctico sin rehacer schema)
-        response = dynamodb.scan(
+        tenant_id = 'pardos'
+        response = _get_dynamodb().scan(
             table_name=os.environ['ORDERS_TABLE'],
             filter_expression='customerId = :cid',
             expression_attribute_values={':cid': customer_id}
@@ -72,7 +102,7 @@ def get_orders_by_customer(event, context):
         orders = [item for item in response.get('Items', []) if item.get('PK', '').startswith(f"TENANT#{tenant_id}")]
         return {
             'statusCode': 200,
-            'body': json.dumps({'orders': orders})
+            'body': json.dumps({'orders': orders}, default=str)  # default=str para Decimal
         }
     except Exception as e:
         return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
@@ -85,14 +115,13 @@ def create_customer(event, context):
         timestamp = datetime.utcnow().isoformat()
         customer = {
             'PK': f"TENANT#{tenant_id}#CUSTOMER#{customer_id}",
-            'SK': 'METADATA',
             'customerId': customer_id,
             'tenantId': tenant_id,
             'name': body.get('name'),
             'email': body.get('email'),
             'createdAt': timestamp
         }
-        dynamodb.put_item(os.environ['CUSTOMERS_TABLE'], customer)
+        _get_dynamodb().put_item(os.environ['CUSTOMERS_TABLE'], customer)
         return {
             'statusCode': 201,
             'body': json.dumps({'customerId': customer_id, 'message': 'Customer created'})
@@ -104,16 +133,16 @@ def get_customer(event, context):
     try:
         customer_id = event['pathParameters']['customerId']
         tenant_id = 'pardos'
-        response = dynamodb.get_item(
+        response = _get_dynamodb().get_item(
             table_name=os.environ['CUSTOMERS_TABLE'],
-            key={'PK': f"TENANT#{tenant_id}#CUSTOMER#{customer_id}", 'SK': 'METADATA'}
+            key={'PK': f"TENANT#{tenant_id}#CUSTOMER#{customer_id}"}
         )
         item = response.get('Item')
         if not item:
             return {'statusCode': 404, 'body': json.dumps({'error': 'Customer not found'})}
         return {
             'statusCode': 200,
-            'body': json.dumps(item)
+            'body': json.dumps(item, default=str)
         }
     except Exception as e:
         return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
@@ -122,35 +151,59 @@ def get_order(event, context):
     try:
         order_id = event['pathParameters']['orderId']
         tenant_id = 'pardos'
-        response = dynamodb.query(
+        pk = f"TENANT#{tenant_id}#ORDER#{order_id}"
+        order_response = _get_dynamodb().query(
             table_name=os.environ['ORDERS_TABLE'],
             key_condition_expression='PK = :pk AND SK = :sk',
             expression_attribute_values={
-                ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}",
-                ':sk': 'METADATA'
+                ':pk': pk,
+                ':sk': 'INFO'
             }
         )
-        item = response.get('Items', [{}])[0]
-        if not item:
+        order = order_response.get('Items', [{}])[0]
+        if not order:
             return {'statusCode': 404, 'body': json.dumps({'error': 'Order not found'})}
+        
+        # Join con customer (solo PK)
+        customer_pk = f"TENANT#{tenant_id}#CUSTOMER#{order['customerId']}"
+        customer_response = _get_dynamodb().get_item(
+            table_name=os.environ['CUSTOMERS_TABLE'],
+            key={'PK': customer_pk}
+        )
+        customer = customer_response.get('Item', {})
+        
+        # Join con steps
+        steps_response = _get_dynamodb().query(
+            table_name=os.environ['STEPS_TABLE'],
+            key_condition_expression='PK = :pk',
+            expression_attribute_values={':pk': pk}
+        )
+        steps = steps_response.get('Items', [])
+        
+        result = {
+            'orderId': order_id,
+            'status': order['status'],
+            'currentStep': order.get('currentStep', 'CREATED'),
+            'total': float(order.get('total', 0)),
+            'items': order.get('items', []),
+            'customer': {'name': customer.get('name', 'N/A'), 'email': customer.get('email', 'N/A')},
+            'steps': [s['stepName'] for s in steps if 'stepName' in s]
+        }
         return {
             'statusCode': 200,
-            'body': json.dumps(item)
+            'body': json.dumps(result, default=str)
         }
     except Exception as e:
         return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
 
 # === FUNCIONES DE DASHBOARD (STUBS - Implementa según necesites) ===
 def obtener_resumen(event, context):
-    # TODO: Implementa query para resumen de orders/steps
     return {'statusCode': 200, 'body': json.dumps({'resumen': 'TODO'})}
 
 def obtener_metricas(event, context):
-    # TODO: Calcula métricas con queries (ej. avg duration)
     return {'statusCode': 200, 'body': json.dumps({'metricas': 'TODO'})}
 
 def obtener_pedidos(event, context):
-    # TODO: Query orders con filtros
     return {'statusCode': 200, 'body': json.dumps({'pedidos': 'TODO'})}
 
 # === FUNCIONES DE ETAPAS MANUALES (API para restaurante) ===
@@ -162,8 +215,9 @@ def iniciar_etapa(event, context):
         stage = body['stage']
         assigned_to = body.get('assignedTo', 'Sistema')
         timestamp = datetime.utcnow().isoformat()
+        pk = f"TENANT#{tenant_id}#ORDER#{order_id}"
         step_record = {
-            'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
+            'PK': pk,
             'SK': f"STEP#{stage}#{timestamp}",
             'stepName': stage,
             'status': 'IN_PROGRESS',
@@ -172,12 +226,12 @@ def iniciar_etapa(event, context):
             'tenantId': tenant_id,
             'orderId': order_id
         }
-        dynamodb.put_item(os.environ['STEPS_TABLE'], step_record)
-        dynamodb.update_item(
+        _get_dynamodb().put_item(os.environ['STEPS_TABLE'], step_record)
+        _get_dynamodb().update_item(
             table_name=os.environ['ORDERS_TABLE'],
             key={
-                'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
-                'SK': 'METADATA'
+                'PK': pk,
+                'SK': 'INFO'
             },
             update_expression="SET currentStep = :step, updatedAt = :now",
             expression_values={
@@ -185,7 +239,7 @@ def iniciar_etapa(event, context):
                 ':now': timestamp
             }
         )
-        events.publish_event(
+        _get_events().publish_event(
             source="pardos.etapas",
             detail_type="StageStarted",
             detail={
@@ -215,11 +269,12 @@ def completar_etapa(event, context):
         order_id = body['orderId']
         tenant_id = body['tenantId']
         stage = body['stage']
-        response = dynamodb.query(
+        pk = f"TENANT#{tenant_id}#ORDER#{order_id}"
+        response = _get_dynamodb().query(
             table_name=os.environ['STEPS_TABLE'],
             key_condition_expression='PK = :pk AND begins_with(SK, :sk)',
             expression_attribute_values={
-                ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}",
+                ':pk': pk,
                 ':sk': f"STEP#{stage}"
             }
         )
@@ -230,7 +285,7 @@ def completar_etapa(event, context):
             }
         latest_step = max(response['Items'], key=lambda x: x['startedAt'])
         timestamp = datetime.utcnow().isoformat()
-        dynamodb.update_item(
+        _get_dynamodb().update_item(
             table_name=os.environ['STEPS_TABLE'],
             key={
                 'PK': latest_step['PK'],
@@ -243,7 +298,7 @@ def completar_etapa(event, context):
                 ':finished': timestamp
             }
         )
-        events.publish_event(
+        _get_events().publish_event(
             source="pardos.etapas",
             detail_type="StageCompleted",
             detail={
@@ -269,201 +324,114 @@ def completar_etapa(event, context):
         }
 
 # === FUNCIONES DE WORKFLOW AUTOMÁTICO (para Step Functions) ===
-def cooking_stage(event, context):
+def process_cooking(event, context):
+    try:
+        order_id = event.get('detail', {}).get('orderId') or event.get('orderId')
+        tenant_id = event.get('tenantId', 'pardos')
+        _update_step(order_id, tenant_id, 'COOKING', 'IN_PROGRESS')
+        return {'orderId': order_id, 'stage': 'COOKING'}
+    except Exception as e:
+        print(f"Error en process_cooking: {str(e)}")
+        raise
+
+def process_packaging(event, context):
     try:
         order_id = event.get('orderId')
         tenant_id = event.get('tenantId', 'pardos')
-        customer_id = event.get('customerId')
-        print(f"Iniciando COOKING para orden: {order_id}")
-        registrar_etapa(tenant_id, order_id, 'COOKING', 'IN_PROGRESS')
-        events.publish_event(
-            source="pardos.etapas",
-            detail_type="StageStarted",
-            detail={
-                'orderId': order_id,
-                'tenantId': tenant_id,
-                'customerId': customer_id,
-                'stage': 'COOKING',
-                'status': 'IN_PROGRESS',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        print(f"Cocinando pedido {order_id}...")
-        return {
-            'status': 'COMPLETED',
-            'message': 'Cooking stage completed',
-            'orderId': order_id,
-            'stage': 'COOKING',
-            'timestamp': datetime.utcnow().isoformat()
-        }
+        _update_step(order_id, tenant_id, 'PACKAGING', 'IN_PROGRESS')
+        return {'orderId': order_id, 'stage': 'PACKAGING'}
     except Exception as e:
-        print(f"Error en cooking_stage: {str(e)}")
-        return {
-            'status': 'FAILED',
-            'error': str(e)
-        }
+        print(f"Error en process_packaging: {str(e)}")
+        raise
 
-def packaging_stage(event, context):
+def process_delivery(event, context):
     try:
         order_id = event.get('orderId')
         tenant_id = event.get('tenantId', 'pardos')
-        customer_id = event.get('customerId')
-        print(f"Iniciando PACKAGING para orden: {order_id}")
-        completar_etapa_automatica(tenant_id, order_id, 'COOKING')
-        registrar_etapa(tenant_id, order_id, 'PACKAGING', 'IN_PROGRESS')
-        events.publish_event(
-            source="pardos.etapas",
-            detail_type="StageStarted",
-            detail={
-                'orderId': order_id,
-                'tenantId': tenant_id,
-                'customerId': customer_id,
-                'stage': 'PACKAGING',
-                'status': 'IN_PROGRESS',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        print(f"Empacando pedido {order_id}...")
-        return {
-            'status': 'COMPLETED',
-            'message': 'Packaging stage completed',
-            'orderId': order_id,
-            'stage': 'PACKAGING',
-            'timestamp': datetime.utcnow().isoformat()
-        }
+        _update_step(order_id, tenant_id, 'DELIVERY', 'IN_PROGRESS')
+        return {'orderId': order_id, 'stage': 'DELIVERY'}
     except Exception as e:
-        print(f"Error en packaging_stage: {str(e)}")
-        return {
-            'status': 'FAILED',
-            'error': str(e)
-        }
+        print(f"Error en process_delivery: {str(e)}")
+        raise
 
-def delivery_stage(event, context):
+def process_delivered(event, context):
     try:
         order_id = event.get('orderId')
         tenant_id = event.get('tenantId', 'pardos')
-        customer_id = event.get('customerId')
-        print(f"Iniciando DELIVERY para orden: {order_id}")
-        completar_etapa_automatica(tenant_id, order_id, 'PACKAGING')
-        registrar_etapa(tenant_id, order_id, 'DELIVERY', 'IN_PROGRESS')
-        events.publish_event(
-            source="pardos.etapas",
-            detail_type="StageStarted",
-            detail={
-                'orderId': order_id,
-                'tenantId': tenant_id,
-                'customerId': customer_id,
-                'stage': 'DELIVERY',
-                'status': 'IN_PROGRESS',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        print(f"Entregando pedido {order_id}...")
-        return {
-            'status': 'COMPLETED',
-            'message': 'Delivery stage completed',
-            'orderId': order_id,
-            'stage': 'DELIVERY',
-            'timestamp': datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        print(f"Error en delivery_stage: {str(e)}")
-        return {
-            'status': 'FAILED',
-            'error': str(e)
-        }
-
-def delivered_stage(event, context):
-    try:
-        order_id = event.get('orderId')
-        tenant_id = event.get('tenantId', 'pardos')
-        customer_id = event.get('customerId')
-        print(f"Completando DELIVERED para orden: {order_id}")
-        completar_etapa_automatica(tenant_id, order_id, 'DELIVERY')
-        registrar_etapa(tenant_id, order_id, 'DELIVERED', 'COMPLETED')
-        actualizar_estado_final(tenant_id, order_id, 'COMPLETED')
-        events.publish_event(
-            source="pardos.etapas",
-            detail_type="OrderCompleted",
-            detail={
-                'orderId': order_id,
-                'tenantId': tenant_id,
-                'customerId': customer_id,
-                'stage': 'DELIVERED',
-                'status': 'COMPLETED',
-                'timestamp': datetime.utcnow().isoformat()
-            }
-        )
-        print(f"Pedido {order_id} completado exitosamente!")
-        return {
-            'status': 'COMPLETED',
-            'message': 'Order delivered successfully',
-            'orderId': order_id,
-            'stage': 'DELIVERED',
-            'timestamp': datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        print(f"Error en delivered_stage: {str(e)}")
-        return {
-            'status': 'FAILED',
-            'error': str(e)
-        }
-
-# === FUNCIONES AUXILIARES (compartidas) ===
-def registrar_etapa(tenant_id, order_id, stage, status):
-    try:
+        pk = f"TENANT#{tenant_id}#ORDER#{order_id}"
         timestamp = datetime.utcnow().isoformat()
+        _get_dynamodb().update_item(
+            table_name=os.environ['ORDERS_TABLE'],
+            key={
+                'PK': pk,
+                'SK': 'INFO'
+            },
+            update_expression="SET currentStep = :step, #s = :status, updatedAt = :now",
+            expression_names={'#s': 'status'},
+            expression_values={
+                ':step': 'DELIVERED',
+                ':status': 'COMPLETED',
+                ':now': timestamp
+            }
+        )
         step_record = {
-            'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
-            'SK': f"STEP#{stage}#{timestamp}",
-            'stepName': stage,
-            'status': status,
+            'PK': pk,
+            'SK': f"STEP#DELIVERED#{timestamp}",
+            'stepName': 'DELIVERED',
+            'status': 'DONE',
             'startedAt': timestamp,
+            'finishedAt': timestamp,
             'tenantId': tenant_id,
             'orderId': order_id
         }
-        if status == 'COMPLETED':
-            step_record['finishedAt'] = timestamp
-        dynamodb.put_item(os.environ['STEPS_TABLE'], step_record)
-        print(f"Etapa {stage} registrada para orden {order_id}")
-    except Exception as e:
-        print(f"Error registrando etapa: {str(e)}")
-
-def completar_etapa_automatica(tenant_id, order_id, stage):
-    try:
-        response = dynamodb.query(
-            table_name=os.environ['STEPS_TABLE'],
-            key_condition_expression='PK = :pk AND begins_with(SK, :sk)',
-            expression_attribute_values={
-                ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}",
-                ':sk': f"STEP#{stage}"
+        _get_dynamodb().put_item(os.environ['STEPS_TABLE'], step_record)
+        _get_events().publish_event(
+            source="pardos.etapas",
+            detail_type="OrderDelivered",
+            detail={
+                'orderId': order_id,
+                'tenantId': tenant_id,
+                'stage': 'DELIVERED',
+                'timestamp': timestamp
             }
         )
-        if response.get('Items'):
-            latest_step = max(response['Items'], key=lambda x: x['startedAt'])
-            timestamp = datetime.utcnow().isoformat()
-            dynamodb.update_item(
-                table_name=os.environ['STEPS_TABLE'],
-                key={
-                    'PK': latest_step['PK'],
-                    'SK': latest_step['SK']
-                },
-                update_expression="SET #s = :status, finishedAt = :finished",
-                expression_names={'#s': 'status'},
-                expression_values={
-                    ':status': 'COMPLETED',
-                    ':finished': timestamp
-                }
-            )
-            print(f"Etapa {stage} completada automaticamente")
+        return {'orderId': order_id, 'stage': 'DELIVERED'}
     except Exception as e:
-        print(f"Error completando etapa automatica: {str(e)}")
+        print(f"Error en process_delivered: {str(e)}")
+        raise
 
-def actualizar_estado_final(tenant_id, order_id, status):
-    print(f"Actualizando estado final del pedido {order_id} a {status}")
-    # TODO: Actualiza en orders table si es necesario
-    pass
+# Auxiliar: Actualizar paso (adaptado a lazy)
+def _update_step(order_id, tenant_id, step, status="IN_PROGRESS"):
+    pk = f"TENANT#{tenant_id}#ORDER#{order_id}"
+    timestamp = datetime.utcnow().isoformat()
+    _get_dynamodb().update_item(
+        table_name=os.environ['ORDERS_TABLE'],
+        key={'PK': pk, 'SK': 'INFO'},
+        update_expression="SET currentStep = :step, #s = :status",
+        expression_names={'#s': 'status'},
+        expression_values={':step': step, ':status': status}
+    )
+    step_record = {
+        'PK': pk,
+        'SK': f"STEP#{step}#{timestamp}",
+        'stepName': step,
+        'status': status,
+        'startedAt': timestamp,
+        'tenantId': tenant_id,
+        'orderId': order_id
+    }
+    _get_dynamodb().put_item(os.environ['STEPS_TABLE'], step_record)
+    _get_events().publish_event(
+        source="pardos.orders",
+        detail_type="OrderStageStarted" if status == "IN_PROGRESS" else "OrderStageCompleted",
+        detail={
+            'orderId': order_id,
+            'step': step,
+            'status': status
+        }
+    )
 
+# === FUNCIONES AUXILIARES (compartidas) ===
 def calcular_duracion(inicio, fin):
     start = datetime.fromisoformat(inicio.replace('Z', '+00:00'))
     end = datetime.fromisoformat(fin.replace('Z', '+00:00'))
