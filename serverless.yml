@@ -1,0 +1,206 @@
+org: amirykehara  # Unificado; cambia si usas la otra org
+service: pardos-unified  # Nombre unificado para cliente + restaurante
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: python3.13
+  region: us-east-1
+  memorySize: 256
+  timeout: 30  # Máximo unificado
+  iam:
+    role: arn:aws:iam::773506457076:role/LabRole  # De la primera cuenta; ajusta si necesario
+  environment:
+    CUSTOMERS_TABLE: CustomersTable
+    ORDERS_TABLE: OrdersTable
+    STEPS_TABLE: StepsTable
+    EVENT_BUS_NAME: PardosEventBus
+  httpApi:
+    cors: true  # Global para todos los endpoints (reemplaza cors: true del segundo)
+
+functions:
+  # === CLIENTE API ===
+  createOrder:
+    handler: handler.create_order
+    events:
+      - httpApi:
+          path: /orders
+          method: post
+  getOrdersByCustomer:
+    handler: handler.get_orders_by_customer
+    events:
+      - httpApi:
+          path: /orders/{customerId}
+          method: get
+  createCustomer:
+    handler: handler.create_customer
+    events:
+      - httpApi:
+          path: /customers
+          method: post
+  getCustomer:
+    handler: handler.get_customer
+    events:
+      - httpApi:
+          path: /customers/{customerId}
+          method: get
+  getOrder:
+    handler: handler.get_order
+    events:
+      - httpApi:
+          path: /order/{orderId}
+          method: get
+
+  # === RESTAURANTE API (Etapas manuales) ===
+  iniciarEtapa:
+    handler: handler.iniciar_etapa
+    events:
+      - httpApi:
+          path: /etapas/iniciar
+          method: post
+  completarEtapa:
+    handler: handler.completar_etapa
+    events:
+      - httpApi:
+          path: /etapas/completar
+          method: post
+
+  # === DASHBOARD API (del segundo; implementa handlers) ===
+  obtenerResumen:
+    handler: handler.obtener_resumen
+    events:
+      - httpApi:
+          path: /dashboard/resumen
+          method: get
+  obtenerMetricas:
+    handler: handler.obtener_metricas
+    events:
+      - httpApi:
+          path: /dashboard/metricas
+          method: get
+  obtenerPedidos:
+    handler: handler.obtener_pedidos
+    events:
+      - httpApi:
+          path: /dashboard/pedidos
+          method: get
+
+  # === WORKFLOW STEP FUNCTIONS (automático via EventBridge) ===
+  cookingStage:
+    handler: handler.cooking_stage
+  packagingStage:
+    handler: handler.packaging_stage
+  deliveryStage:
+    handler: handler.delivery_stage
+  deliveredStage:
+    handler: handler.delivered_stage
+
+resources:
+  Resources:
+    # === TABLAS DYNAMODB (unificadas) ===
+    CustomersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: CustomersTable
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: OrdersTable
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+    StepsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: StepsTable
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+
+    # === EVENTBRIDGE ===
+    PardosEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: PardosEventBus
+
+    # Rule: OrderCreated -> Step Functions (directo, eficiente)
+    OrderCreatedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref PardosEventBus
+        EventPattern:
+          source:
+            - "pardos.orders"
+          detail-type:
+            - "OrderCreated"
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderWorkflowStateMachine
+            Id: StepFunctionsTarget
+            RoleArn: arn:aws:iam::773506457076:role/LabRole
+
+    # === STEP FUNCTIONS ===
+    OrderWorkflowStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: OrderWorkflow
+        DefinitionString: !Sub |
+          {
+            "Comment": "Flujo de pedido: CREATED → COOKING → PACKAGING → DELIVERY → DELIVERED",
+            "StartAt": "Cooking",
+            "States": {
+              "Cooking": {
+                "Type": "Task",
+                "Resource": "${CookingStageLambdaFunction.Arn}",
+                "Next": "Packaging"
+              },
+              "Packaging": {
+                "Type": "Task",
+                "Resource": "${PackagingStageLambdaFunction.Arn}",
+                "Next": "Delivery"
+              },
+              "Delivery": {
+                "Type": "Task",
+                "Resource": "${DeliveryStageLambdaFunction.Arn}",
+                "Next": "Delivered"
+              },
+              "Delivered": {
+                "Type": "Task",
+                "Resource": "${DeliveredStageLambdaFunction.Arn}",
+                "End": true
+              }
+            }
+          }
+        RoleArn: arn:aws:iam::773506457076:role/LabRole
+
+# Opcional: Para paquetes Python externos
+# custom:
+#   pythonRequirements:
+#     dockerizePip: true
