@@ -7,14 +7,14 @@ provider:
   runtime: python3.13
   region: us-east-1
   memorySize: 256
-  timeout: 30  # Máximo unificado
+  timeout: 29  # Reducido para evitar warnings en HTTP API (max 30s)
   iam:
     role: arn:aws:iam::773506457076:role/LabRole  # De la primera cuenta; ajusta si necesario
   environment:
-    CUSTOMERS_TABLE: CustomersTable
-    ORDERS_TABLE: OrdersTable
-    STEPS_TABLE: StepsTable
-    EVENT_BUS_NAME: PardosEventBus
+    CUSTOMERS_TABLE: CustomersTable-${self:provider.stage}
+    ORDERS_TABLE: OrdersTable-${self:provider.stage}
+    STEPS_TABLE: StepsTable-${self:provider.stage}
+    EVENT_BUS_NAME: PardosEventBus-${self:provider.stage}
   httpApi:
     cors: true  # Global para todos los endpoints (reemplaza cors: true del segundo)
 
@@ -97,11 +97,11 @@ functions:
 
 resources:
   Resources:
-    # === TABLAS DYNAMODB (unificadas) ===
+    # === TABLAS DYNAMODB (unificadas con suffix stage) ===
     CustomersTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: CustomersTable
+        TableName: !Sub CustomersTable-${AWS::StackName}  # Ej: CustomersTable-pardos-unified-dev
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -116,7 +116,7 @@ resources:
     OrdersTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: OrdersTable
+        TableName: !Sub OrdersTable-${AWS::StackName}
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -131,7 +131,7 @@ resources:
     StepsTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: StepsTable
+        TableName: !Sub StepsTable-${AWS::StackName}
         AttributeDefinitions:
           - AttributeName: PK
             AttributeType: S
@@ -148,7 +148,7 @@ resources:
     PardosEventBus:
       Type: AWS::Events::EventBus
       Properties:
-        Name: PardosEventBus
+        Name: !Sub PardosEventBus-${AWS::StackName}  # Ej: PardosEventBus-pardos-unified-dev
 
     # Rule: OrderCreated -> Step Functions (directo, eficiente)
     OrderCreatedRule:
@@ -170,7 +170,7 @@ resources:
     OrderWorkflowStateMachine:
       Type: AWS::StepFunctions::StateMachine
       Properties:
-        StateMachineName: OrderWorkflow
+        StateMachineName: !Sub OrderWorkflow-${AWS::StackName}
         DefinitionString: !Sub |
           {
             "Comment": "Flujo de pedido: CREATED → COOKING → PACKAGING → DELIVERY → DELIVERED",
