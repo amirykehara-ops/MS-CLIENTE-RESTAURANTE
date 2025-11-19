@@ -196,15 +196,89 @@ def get_order(event, context):
     except Exception as e:
         return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
 
-# === FUNCIONES DE DASHBOARD (STUBS - Implementa según necesites) ===
+# === FUNCIONES DE DASHBOARD (DATOS REALES) ===
 def obtener_resumen(event, context):
-    return {'statusCode': 200, 'body': json.dumps({'resumen': 'TODO'})}
+    """
+    Obtiene resumen general para el dashboard - DATOS REALES
+    """
+    try:
+        tenant_id = 'pardos'  # Por defecto
+        
+        # Obtener métricas REALES desde DynamoDB
+        total_pedidos = obtener_total_pedidos(tenant_id)
+        pedidos_hoy = obtener_pedidos_hoy(tenant_id)
+        pedidos_activos = obtener_pedidos_activos(tenant_id)
+        tiempo_promedio = obtener_tiempo_promedio_real(tenant_id)
+        
+        resumen = {
+            'totalPedidos': total_pedidos,
+            'pedidosHoy': pedidos_hoy,
+            'pedidosActivos': pedidos_activos,
+            'tiempoPromedioEntrega': tiempo_promedio,
+            'ultimaActualizacion': datetime.utcnow().isoformat()
+        }
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(resumen, default=str)
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
 
 def obtener_metricas(event, context):
-    return {'statusCode': 200, 'body': json.dumps({'metricas': 'TODO'})}
+    """
+    Obtiene métricas detalladas para gráficos - DATOS REALES
+    """
+    try:
+        tenant_id = 'pardos'
+        
+        metricas = {
+            'pedidosPorEstado': obtener_pedidos_por_estado_real(tenant_id),
+            'tiemposPorEtapa': obtener_tiempos_por_etapa_real(tenant_id),
+            'pedidosUltimaSemana': obtener_pedidos_ultima_semana_real(tenant_id),
+            'productosPopulares': obtener_productos_populares_real(tenant_id)
+        }
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(metricas, default=str)
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
 
 def obtener_pedidos(event, context):
-    return {'statusCode': 200, 'body': json.dumps({'pedidos': 'TODO'})}
+    """
+    Obtiene lista de pedidos REALES para el dashboard - DATOS REALES
+    """
+    try:
+        tenant_id = 'pardos'
+        limit = 50
+        
+        # Obtener pedidos REALES desde la tabla de orders
+        pedidos_reales = obtener_pedidos_reales(tenant_id, limit)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'pedidos': pedidos_reales,
+                'total': len(pedidos_reales),
+                'message': 'Datos reales desde DynamoDB'
+            }, default=str)
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
 
 # === FUNCIONES DE ETAPAS MANUALES (API para restaurante) ===
 def iniciar_etapa(event, context):
