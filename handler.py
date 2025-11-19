@@ -552,7 +552,94 @@ def obtener_pedidos_reales(tenant_id, limit=50):
                 table_name=os.environ['STEPS_TABLE'],
                 key_condition_expression='PK = :pk',
                 expression_attribute_values={
-                    ':pk': f"TENANT#{tenant_id
+                    ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}"
+                }
+            )
+            etapas = etapas_response.get('Items', [])
+            
+            # Formatear el pedido con datos REALES
+            pedido_completo = {
+                'orderId': order_id,
+                'customerId': pedido.get('customerId', 'N/A'),
+                'status': pedido.get('status', 'CREATED'),
+                'createdAt': pedido.get('createdAt', ''),
+                'etapas': [],
+                'items': pedido.get('items', []),  # ITEMS REALES del pedido
+                'total': float(pedido.get('total', 0))  # TOTAL REAL del pedido
+            }
+            
+            # Agregar etapas formateadas
+            for etapa in etapas:
+                etapa_info = {
+                    'stepName': etapa.get('stepName'),
+                    'status': etapa.get('status', 'IN_PROGRESS'),
+                    'startedAt': etapa.get('startedAt'),
+                    'finishedAt': etapa.get('finishedAt')
+                }
+                pedido_completo['etapas'].append(etapa_info)
+            
+            pedidos_completos.append(pedido_completo)
+        
+        # Ordenar por fecha de creación descendente
+        pedidos_completos.sort(key=lambda x: x.get('createdAt', ''), reverse=True)
+        
+        # Aplicar límite
+        pedidos_completos = pedidos_completos[:limit]
+        
+        return pedidos_completos
+        
+    except Exception as e:
+        print(f"Error obteniendo pedidos reales: {str(e)}")
+        return []
+
+def calcular_duracion_minutos(inicio, fin):
+    """Calcula duración en minutos entre dos timestamps"""
+    start = datetime.fromisoformat(inicio.replace('Z', '+00:00'))
+    end = datetime.fromisoformat(fin.replace('Z', '+00:00'))
+    return int((end - start).total_seconds() / 60)
+
+def calcular_tiempo_total_pedido(tenant_id, order_id):
+    """Calcula tiempo total de un pedido desde creación hasta entrega"""
+    try:
+        # Obtener pedido
+        pedido_response = _get_dynamodb().get_item(
+            table_name=os.environ['ORDERS_TABLE'],
+            key={
+                'PK': f"TENANT#{tenant_id}#ORDER#{order_id}",
+                'SK': 'INFO'
+            }
+        )
+        pedido = pedido_response.get('Item', {})
+        
+        # Obtener todas las etapas
+        etapas_response = _get_dynamodb().query(
+            table_name=os.environ['STEPS_TABLE'],
+            key_condition_expression='PK = :pk',
+            expression_attribute_values={
+                ':pk': f"TENANT#{tenant_id}#ORDER#{order_id}"
+            }
+        )
+        etapas = etapas_response.get('Items', [])
+        
+        if not pedido or not etapas:
+            return 0
+        
+        # Encontrar primera y última etapa
+        primera_etapa = min(etapas, key=lambda x: x.get('startedAt', ''))
+        ultima_etapa_completada = None
+        
+        for etapa in etapas:
+            if etapa.get('status') == 'COMPLETED' and etapa.get('finishedAt'):
+                if not ultima_etapa_completada or etapa.get('finishedAt') > ultima_etapa_completada.get('finishedAt', ''):
+                    ultima_etapa_completada = etapa
+        
+        if primera_etapa.get('startedAt') and ultima_etapa_completada and ultima_etapa_completada.get('finishedAt'):
+            return calcular_duracion_minutos(primera_etapa['startedAt'], ultima_etapa_completada['finishedAt'])
+        
+        return 0
+    except Exception as e:
+        print(f"Error calculando tiempo total pedido: {str(e)}")
+        return 0
                                      
 
 # === FUNCIONES DE ETAPAS MANUALES (API para restaurante) ===
