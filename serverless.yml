@@ -58,7 +58,7 @@ functions:
     handler: handler.completar_etapa
     events:
       - httpApi:
-          path: /etapas/completar
+          path:  /etapas/completar
           method: post
   obtenerResumen:
     handler: handler.obtener_resumen
@@ -100,6 +100,7 @@ resources:
           - AttributeName: PK
             KeyType: HASH
         BillingMode: PAY_PER_REQUEST
+
     OrdersTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -124,6 +125,7 @@ resources:
                 KeyType: HASH
             Projection:
               ProjectionType: ALL
+
     StepsTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -139,13 +141,16 @@ resources:
           - AttributeName: SK
             KeyType: RANGE
         BillingMode: PAY_PER_REQUEST
+
     PardosEventBus:
       Type: AWS::Events::EventBus
       Properties:
         Name: PardosEventBus-pardos-unified-dev
+
     OrderCreatedRule:
       Type: AWS::Events::Rule
       Properties:
+        Name: OrderCreatedRule
         EventBusName: !Ref PardosEventBus
         EventPattern:
           source:
@@ -154,16 +159,16 @@ resources:
             - "OrderCreated"
         State: ENABLED
         Targets:
-          - Arn: !Ref OrderWorkflowStateMachine
-            Id: StepFunctionsTarget
+          - Arn: !GetAtt OrderWorkflowStateMachine.Arn
+            Id: StartExecution
             RoleArn: arn:aws:iam::773506457076:role/LabRole
+
     OrderWorkflowStateMachine:
       Type: AWS::StepFunctions::StateMachine
       Properties:
         StateMachineName: OrderWorkflow-pardos-unified-dev
         DefinitionString: !Sub |
           {
-            "Comment": "Flujo de pedido: CREATED → COOKING → PACKAGING → DELIVERY → DELIVERED",
             "StartAt": "Cooking",
             "States": {
               "Cooking": {
