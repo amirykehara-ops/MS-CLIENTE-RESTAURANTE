@@ -1,6 +1,5 @@
 org: amirykehara
 service: pardos-unified
-
 provider:
   name: aws
   runtime: python3.13
@@ -8,15 +7,16 @@ provider:
   memorySize: 256
   timeout: 29
   iam:
-    role: arn:aws:iam::773506457076:role/LabRole
+    role: arn:aws:iam::773506457076:role/LabRole  # Rol existente
   environment:
     CUSTOMERS_TABLE: CustomersTable-pardos-unified-dev
     ORDERS_TABLE: OrdersTable-pardos-unified-dev
     STEPS_TABLE: StepsTable-pardos-unified-dev
+    INVENTORY_TABLE: InventoryTable-pardos-unified-dev
     EVENT_BUS_NAME: PardosEventBus-pardos-unified-dev
+    # SNS_REJECTION_TOPIC_ARN movido a Outputs (resuelto post-deploy en Lambdas)
   httpApi:
     cors: true
-
 functions:
   createOrder:
     handler: handler.create_order
@@ -58,7 +58,7 @@ functions:
     handler: handler.completar_etapa
     events:
       - httpApi:
-          path:  /etapas/completar
+          path: /etapas/completar
           method: post
   obtenerResumen:
     handler: handler.obtener_resumen
@@ -78,6 +78,7 @@ functions:
       - httpApi:
           path: /dashboard/pedidos
           method: get
+  # Tus funciones originales (nombres en camelCase → CloudFormation genera XxxLambdaFunction)
   cookingStage:
     handler: handler.process_cooking
   packagingStage:
@@ -86,7 +87,11 @@ functions:
     handler: handler.process_delivery
   deliveredStage:
     handler: handler.process_delivered
-
+  # NUEVAS (mismo estilo)
+  checkInventory:
+    handler: handler.check_inventory
+  rejectOrder:
+    handler: handler.reject_order
 resources:
   Resources:
     CustomersTable:
@@ -100,7 +105,6 @@ resources:
           - AttributeName: PK
             KeyType: HASH
         BillingMode: PAY_PER_REQUEST
-
     OrdersTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -125,7 +129,6 @@ resources:
                 KeyType: HASH
             Projection:
               ProjectionType: ALL
-
     StepsTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -141,12 +144,21 @@ resources:
           - AttributeName: SK
             KeyType: RANGE
         BillingMode: PAY_PER_REQUEST
-
+    InventoryTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: InventoryTable-pardos-unified-dev
+        AttributeDefinitions:
+          - AttributeName: productId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: productId
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
     PardosEventBus:
       Type: AWS::Events::EventBus
       Properties:
         Name: PardosEventBus-pardos-unified-dev
-
     OrderCreatedRule:
       Type: AWS::Events::Rule
       Properties:
@@ -162,35 +174,64 @@ resources:
           - Arn: !GetAtt OrderWorkflowStateMachine.Arn
             Id: StartExecution
             RoleArn: arn:aws:iam::773506457076:role/LabRole
-
     OrderWorkflowStateMachine:
       Type: AWS::StepFunctions::StateMachine
       Properties:
         StateMachineName: OrderWorkflow-pardos-unified-dev
         DefinitionString: !Sub |
           {
-            "StartAt": "Cooking",
+            "Comment": "Validación de stock + envío a cocina",
+            "StartAt": "CheckInventory",
             "States": {
+              "CheckInventory": {
+                "Type": "Task",
+                "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CheckInventoryLambdaFunction}",
+                "Next": "Cooking",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "Next": "PassToReject",
+                    "ResultPath": "$.error"
+                  }
+                ]
+              },
+              "PassToReject": {
+                "Type": "Pass",
+                "Parameters": {
+                  "detail.$": "$",
+                  "error.$": "$.error"
+                },
+                "Next": "RejectOrder"
+              },
               "Cooking": {
                 "Type": "Task",
-                "Resource": "${CookingStageLambdaFunction.Arn}",
-                "Next": "Packaging"
+                "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CookingStageLambdaFunction}",
+                "End": true
               },
-              "Packaging": {
+              "RejectOrder": {
                 "Type": "Task",
-                "Resource": "${PackagingStageLambdaFunction.Arn}",
-                "Next": "Delivery"
-              },
-              "Delivery": {
-                "Type": "Task",
-                "Resource": "${DeliveryStageLambdaFunction.Arn}",
-                "Next": "Delivered"
-              },
-              "Delivered": {
-                "Type": "Task",
-                "Resource": "${DeliveredStageLambdaFunction.Arn}",
+                "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${RejectOrderLambdaFunction}",
                 "End": true
               }
             }
           }
         RoleArn: arn:aws:iam::773506457076:role/LabRole
+    # NUEVO: SNS Topic para notificaciones de rechazo
+    OrderRejectionTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: OrderRejection-pardos-unified-dev
+        DisplayName: "Notificaciones de Pedidos Rechazados"
+    # NUEVO: Suscripción de email al topic (pendiente de confirmación)
+    OrderRejectionEmailSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Protocol: email
+        TopicArn: !Ref OrderRejectionTopic
+        Endpoint: amir.ykehara@utec.edu.pe  # ← Cambia si usas otro correo
+  Outputs:
+    SnsRejectionTopicArn:  # ← NUEVO: Exporta el ARN como env var para Lambdas
+      Description: "ARN del SNS Topic para rechazos"
+      Value: !Ref OrderRejectionTopic
+      Export:
+        Name: !Sub "${AWS::StackName}-SnsRejectionTopicArn"
